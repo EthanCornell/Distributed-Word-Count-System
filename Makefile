@@ -1,6 +1,6 @@
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -Wall -Wextra -std=c++11
+CXXFLAGS = -Wall -Wextra -std=c++17 -fopenmp
 
 # Targets
 TARGETS = server client
@@ -17,11 +17,11 @@ all: $(TARGETS) $(DIR)
 
 # Build the server
 server: $(SERVER_OBJS)
-	$(CXX) $(CXXFLAGS) -o server $(SERVER_OBJS)
+	$(CXX) $(CXXFLAGS) -o server $(SERVER_OBJS) $(LDFLAGS)
 
 # Build the client
 client: $(CLIENT_OBJS)
-	$(CXX) $(CXXFLAGS) -o client $(CLIENT_OBJS)
+	$(CXX) $(CXXFLAGS) -o client $(CLIENT_OBJS) $(LDFLAGS)
 
 # Rule to compile server.o
 server.o: server.cpp

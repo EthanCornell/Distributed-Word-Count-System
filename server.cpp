@@ -1,160 +1,266 @@
-// Author: I-Hsuan Huang
-// email: ethan.huang.ih@gmail.com
+/*
+ * This file is part of word count distributed system project.
+ *
+ * word count distributed system project is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * word count distributed system project is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with word count distributed system project.  If not, see
+ * <https://www.gnu.org/licenses/>.
+ *
+ * Author: I-Hsuan Huang
+ * Email: ethan.huang.ih@gmail.com
+ * File: server.cpp
+ */
 
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <map>
+#include <unordered_map>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <cstdlib>
-#include <signal.h>
-#include <sys/time.h> 
-#include <sys/resource.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
+#include <omp.h> 
 
-// Function to count words in a file and update the word count map
-void count_words_in_file(const std::string& file_path, std::map<std::string, int>& word_count) {
-    std::ifstream file(file_path);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open file: " << file_path << std::endl;
+// Global data structures
+std::queue<std::string> job_queue;
+std::mutex queue_mutex;
+std::condition_variable queue_cv;
+bool done = false;
+std::unordered_map<std::string, int> global_word_count;
+std::mutex global_count_mutex; // Mutex for global word count
+
+// Memory-mapped word counting for large files
+void count_words_in_file_mmap(const std::string& file_path, std::unordered_map<std::string, int>& local_word_count) {
+    int fd = open(file_path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        std::cerr << "[ERROR] Failed to open file: " << file_path << std::endl;
+        return;
+    }
+
+    struct stat sb;
+    if (fstat(fd, &sb) == -1) {
+        std::cerr << "[ERROR] Failed to stat file: " << file_path << std::endl;
+        close(fd);
+        return;
+    }
+
+    if (sb.st_size == 0) {
+        std::cerr << "[INFO] File is empty: " << file_path << std::endl;
+        close(fd);
+        return;
+    }
+
+    char *file_data = static_cast<char*>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+    if (file_data == MAP_FAILED) {
+        std::cerr << "[ERROR] Failed to mmap file: " << file_path << std::endl;
+        close(fd);
         return;
     }
 
     std::string word;
-    while (file >> word) {
-        ++word_count[word];
+    for (off_t i = 0; i < sb.st_size; ++i) {
+        if (isalnum(file_data[i])) {
+            word += file_data[i];
+        } else if (!word.empty()) {
+            ++local_word_count[word];
+            word.clear();
+        }
+    }
+
+    munmap(file_data, sb.st_size);
+    close(fd);
+}
+
+// Worker function with parallelism using OpenMP (Map Phase)
+void mapper_function() {
+    while (true) {
+        std::string file_data;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            queue_cv.wait(lock, [] { return !job_queue.empty() || done; });
+
+            if (job_queue.empty() && done) {
+                break;
+            }
+
+            file_data = job_queue.front();
+            job_queue.pop();
+        }
+
+        auto start_time = std::chrono::high_resolution_clock::now(); // Start processing timer
+
+        std::istringstream file_stream(file_data);
+        std::string file_path;
+        std::unordered_map<std::string, int> local_word_count; // Intermediate word count (local to the worker)
+
+        std::vector<std::string> file_paths;
+        // Collect file paths from the batch
+        while (std::getline(file_stream, file_path)) {
+            if (!file_path.empty()) {
+                file_paths.push_back(file_path);
+            }
+        }
+
+        // Use OpenMP parallel for to process each file in parallel
+        #pragma omp parallel for
+        for (long unsigned int i = 0; i < file_paths.size(); ++i) {
+            std::unordered_map<std::string, int> thread_word_count;
+            count_words_in_file_mmap(file_paths[i], thread_word_count);
+
+            // Shuffle Phase: Merge thread word counts into the local word count
+            std::lock_guard<std::mutex> lock(global_count_mutex);
+            for (const auto& entry : thread_word_count) {
+                local_word_count[entry.first] += entry.second;
+            }
+        }
+
+        // Log the word counts for the current batch
+        if (!local_word_count.empty()) {
+            std::cout << "[INFO] Word counts for the current batch:" << std::endl;
+            for (const auto& entry : local_word_count) {
+                std::cout << entry.first << ": " << entry.second << std::endl;
+            }
+        } else {
+            std::cout << "[INFO] No valid files were processed in this batch." << std::endl;
+        }
+
+        // Shuffle Phase: Merge local word counts into the global word count
+        {
+            std::lock_guard<std::mutex> lock(global_count_mutex);
+            for (const auto& entry : local_word_count) {
+                global_word_count[entry.first] += entry.second;
+            }
+        }
+
+        auto end_time = std::chrono::high_resolution_clock::now(); // End processing timer
+        std::chrono::duration<double> elapsed = end_time - start_time;
+        std::cout << "[INFO] Time taken to process batch: " << elapsed.count() << " seconds" << std::endl;
     }
 }
 
-// Function to process client requests
-void process_client(int client_socket) {
-    struct timeval start, end;
-    gettimeofday(&start, NULL); // Record the start time
-
-    struct rusage usage_before, usage_after;
-    getrusage(RUSAGE_SELF, &usage_before); // Get CPU usage before processing
-
-    static int file_count = 0;  // Static variable to track files processed by this process
-
+// Handle incoming connections from clients (each connection spawns a thread)
+void handle_client(int client_socket) {
     char buffer[1024];
     int read_size;
-    std::string partial_path;
-    std::map<std::string, int> word_count;
+    std::string data;
 
+    // Receive data from client
+    auto start_time = std::chrono::high_resolution_clock::now();
     while ((read_size = recv(client_socket, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[read_size] = '\0';  // Null-terminate the received data
-        std::string received_data(buffer);
+        buffer[read_size] = '\0';
+        data += buffer;
+    }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
 
-        // Handle potential partial path from previous recv call
-        if (!partial_path.empty()) {
-            received_data = partial_path + received_data;
-            partial_path.clear();
-        }
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "[INFO] Time taken to receive data from client: " << elapsed.count() << " seconds" << std::endl;
 
-        size_t pos;
-        while ((pos = received_data.find('\n')) != std::string::npos) {
-            std::string file_path = received_data.substr(0, pos);
-            received_data.erase(0, pos + 1);
-
-            // Increment the file count
-            file_count++;
-            std::cout << "Process " << getpid() << " processed file: " << file_path << std::endl;
-
-            count_words_in_file(file_path, word_count);
-        }
-
-        // If there is any leftover data that doesn't end with a newline, save it for the next recv
-        if (!received_data.empty()) {
-            partial_path = received_data;
-        }
+    if (data.empty()) {
+        std::cerr << "[ERROR] Received empty data from client." << std::endl;
+        close(client_socket);
+        return;
     }
 
-    // Print the word counts
-    for (const auto& [word, count] : word_count) {
-        std::cout << word << " " << count << std::endl;
+    // Add received data (file paths) to the job queue
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        job_queue.push(data);
     }
-
-    // Record the end time and get CPU usage after processing
-    gettimeofday(&end, NULL);
-    getrusage(RUSAGE_SELF, &usage_after);
-
-    double processing_time = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_usec - start.tv_usec) / 1000.0; // Convert to milliseconds
-    double user_cpu_time = (usage_after.ru_utime.tv_sec - usage_before.ru_utime.tv_sec) * 1000.0 + (usage_after.ru_utime.tv_usec - usage_before.ru_utime.tv_usec) / 1000.0;
-    double system_cpu_time = (usage_after.ru_stime.tv_sec - usage_before.ru_stime.tv_sec) * 1000.0 + (usage_after.ru_stime.tv_usec - usage_before.ru_stime.tv_usec) / 1000.0;
-
-    std::cout << "Process " << getpid() << " processed " << file_count << " files in " << processing_time << " ms." << std::endl;
-    std::cout << "Process " << getpid() << " used " << user_cpu_time << " ms in user mode and " << system_cpu_time << " ms in system mode." << std::endl;
+    queue_cv.notify_one();
 
     close(client_socket);
-    exit(0);  // Terminate the child process
-}
-
-
-
-// Signal handler to reap zombie processes
-void sigchld_handler(int sig) {
-    while (waitpid(-1, nullptr, WNOHANG) > 0);
 }
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cerr << "Usage: ./server <num_processes>" << std::endl;
+        std::cerr << "Usage: ./server <num_workers>" << std::endl;
         return 1;
     }
 
-    int num_processes = std::atoi(argv[1]);
+    int num_workers = std::atoi(argv[1]);
 
+    // Start worker threads (mappers)
+    std::vector<std::thread> workers;
+    for (int i = 0; i < num_workers; ++i) {
+        workers.emplace_back(mapper_function);
+    }
+
+    // Set up server socket
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
-        std::cerr << "Failed to create socket" << std::endl;
+        std::cerr << "[ERROR] Failed to create socket, errno: " << errno << std::endl;
         return 1;
     }
+    std::cout << "[INFO] Server socket created." << std::endl;
 
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(8080);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
+    // Bind the socket to the server address
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "Bind failed" << std::endl;
+        std::cerr << "[ERROR] Bind failed, errno: " << errno << std::endl;
         return 1;
     }
+    std::cout << "[INFO] Socket successfully bound to port 8080." << std::endl;
 
-    listen(server_socket, 3);
-
-    // Set up the signal handler to avoid zombie processes
-    signal(SIGCHLD, sigchld_handler);
-
-    // Fork the specified number of worker processes
-    for (int i = 0; i < num_processes; ++i) {
-        pid_t pid = fork();
-        if (pid < 0) {
-            std::cerr << "Fork failed" << std::endl;
-            return 1;
-        }
-        if (pid == 0) {  // Child process
-            while (true) {
-                int client_socket = accept(server_socket, nullptr, nullptr);
-                if (client_socket < 0) {
-                    std::cerr << "Accept failed" << std::endl;
-                    continue;
-                }
-                process_client(client_socket);
-            }
-            // The child process should exit if the loop breaks, but it should never actually break in this case.
-        }
-        // Parent process continues to fork the next worker
+    if (listen(server_socket, 100) < 0) {
+        std::cerr << "[ERROR] Listen failed, errno: " << errno << std::endl;
+        return 1;
     }
+    std::cout << "[INFO] Server is listening for connections..." << std::endl;
 
-    // Parent process remains running indefinitely, reaping child processes as needed
+    // Accept clients in a loop
     while (true) {
-        pause();  // Wait for signals (like SIGCHLD)
+        int client_socket = accept(server_socket, nullptr, nullptr);
+        if (client_socket < 0) {
+            std::cerr << "[ERROR] Accept failed, errno: " << errno << std::endl;
+            continue;
+        }
+        std::cout << "[INFO] Accepted new client connection." << std::endl;
+
+        std::thread(handle_client, client_socket).detach();
     }
 
     close(server_socket);
+
+    // Graceful shutdown
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        done = true;
+    }
+    queue_cv.notify_all();
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    // Reduce Phase: Print final aggregated word count
+    std::cout << "[INFO] Final word counts: " << std::endl;
+    for (const auto& entry : global_word_count) {
+        std::cout << entry.first << ": " << entry.second << std::endl;
+    }
+
     return 0;
 }
-
-
