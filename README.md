@@ -106,6 +106,7 @@ This updated solution is a significant improvement over the previous implementat
 | **Scalability**        | Limited by process overhead           | Scalable with efficient thread management  | 
 
 These changes result in a more efficient and scalable server-side implementation, particularly for high-concurrency and large-scale file processing environments.
+
 ---
 
 ### 1. System Overview
